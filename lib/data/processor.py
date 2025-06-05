@@ -16,7 +16,6 @@ class LogsDataProcessor:
         self._org_columns = columns
         self._dir_path = dir_path
         
-        # Create directory for dataset if it doesn't exist
         if not os.path.exists(f"{dir_path}/{self._name}"):
             os.makedirs(f"{dir_path}/{self._name}")
         self._filepath = f"{dir_path}/{self._name}/{self._name}.csv"
@@ -26,12 +25,12 @@ class LogsDataProcessor:
         
         Args:
             sort_temporally: Whether to sort events by timestamp
-            add_eoc: Whether to add [EOC] (End of Case) markers
+            add_eoc: Whether to add [EOC] (End of Case)
             
         Returns:
             Preprocessed DataFrame
         """
-        # Load and select columns
+        # Load CSV file if it exists, otherwise load XES file
         if os.path.exists(self._filepath):
             df = pd.read_csv(self._filepath)
         else:
@@ -43,10 +42,8 @@ class LogsDataProcessor:
         # Standardize column names
         df.columns = ["case:concept:name", "concept:name", "time:timestamp"]
         
-        # Ensure all activities are strings before applying string operations
-        df["concept:name"] = df["concept:name"].astype(str)
-        
         # Clean activity names and timestamps
+        df["concept:name"] = df["concept:name"].astype(str)
         df["concept:name"] = df["concept:name"].str.lower()
         df["concept:name"] = df["concept:name"].str.replace(" ", "-")
         df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
@@ -55,16 +52,11 @@ class LogsDataProcessor:
         if sort_temporally:
             df = df.sort_values(by=["case:concept:name", "time:timestamp"])
         
-        # Add [EOC] marker if requested
+        # Add [EOC] if requested
         if add_eoc:
-            # Get the last event of each case
             last_events = df.groupby("case:concept:name").tail(1).copy()
             last_events["concept:name"] = "[EOC]"
-            
-            # Add time offset to ensure [EOC] comes after the actual last event
             last_events["time:timestamp"] = last_events["time:timestamp"] + pd.Timedelta(seconds=1)
-            
-            # Append to the original dataframe and sort again
             df = pd.concat([df, last_events]).sort_values(by=["case:concept:name", "time:timestamp"])
         
         # Convert timestamps to string format for output
@@ -92,19 +84,16 @@ class LogsDataProcessor:
         timestamps = []
         next_acts = []
         
-        # Process each case
         for case_id, case_df in grouped:
             # Skip cases with only one event
             if len(case_df) <= 1:
                 continue
                 
-            # Get activities and timestamps
             activities = case_df["concept:name"].tolist()
             case_timestamps = case_df["time:timestamp"].tolist()
             
             # Create prefixes for each position in the case
             for i in range(len(activities) - 1):
-                # Extract prefix (use all events up to current position)
                 prefix = " ".join(activities[:i+1])
                 
                 # Store the data

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 def soft_cross_entropy(preds, targets):
     """
     Compute cross entropy loss with soft labels.
-    Works with both one-hot encoded and soft (mixup) labels.
+    Works with both one-hot encoded and soft (mixup) labels if data augmentation is used.
     
     Args:
         preds: Raw logits from the model
@@ -111,8 +111,9 @@ class IncrementalLSTMClassifier(nn.Module):
         if new_classes > self.classifier.out_features:
             old_weight = self.classifier.weight.data
             old_bias = self.classifier.bias.data
+            device = self.classifier.weight.device
             
-            new_classifier = nn.Linear(self.classifier.in_features, new_classes)
+            new_classifier = nn.Linear(self.classifier.in_features, new_classes).to(device)
             with torch.no_grad():
                 new_classifier.weight[:self.classifier.out_features] = old_weight
                 new_classifier.bias[:self.classifier.out_features] = old_bias
@@ -120,7 +121,7 @@ class IncrementalLSTMClassifier(nn.Module):
                 # Initialize new weights with small random values
                 new_classifier.weight[self.classifier.out_features:] = torch.randn(
                     new_classes - self.classifier.out_features, 
-                    self.classifier.in_features) * 0.02
+                    self.classifier.in_features, device=device) * 0.02
                 new_classifier.bias[self.classifier.out_features:] = 0
                 
             self.classifier = new_classifier
@@ -295,37 +296,12 @@ def evaluate_model(model, val_loader, loss_fn=None):
     
     return avg_loss, accuracy
 
-def predict_model_1(model, test_dataloader, device=None):
+def model_predict(model, test_dataloader, device=None):
     """Predict the model on the given dataset.
     
     Args:
         model: The model to be predicted.
-        dataloader: DataLoader with validation batches.
-    """ 
-    device = next(model.parameters()).device
-    model.to(device)
-    model.eval()
-    predictions = []
-    ground_truth = []
-    with torch.no_grad():
-        for inputs, labels, _ in test_dataloader:
-            if labels.ndim == 2:
-                labels = labels.argmax(dim=1)
-            inputs, labels = inputs.to(device), labels.to(device)
-            outputs = model(inputs)
-            _, predicted = torch.max(outputs, 1)
-            predictions.append(predicted)
-            ground_truth.append(labels)
-    # Compute accuracy
-    accuracy = sum(predictions == ground_truth) / len(predictions)
-    return accuracy, torch.cat(predictions), torch.cat(ground_truth)
-
-def predict_model(model, test_dataloader, device=None):
-    """Predict the model on the given dataset.
-    
-    Args:
-        model: The model to be predicted.
-        test_dataloader: DataLoader with validation batches.
+        test_dataloader: DataLoader with test batches.
         device: Device to use for computations.
     
     Returns:
@@ -414,7 +390,7 @@ def update_model(model, dataloader, lr=0.001, epochs=100, patience=10, device=No
     betas=(0.9, 0.999),
     eps=1e-08,
     weight_decay=0,       
-    momentum_decay=0.004  # Equivalent to schedule_decay in Keras
+    momentum_decay=0.004
     )
     loss_fn = nn.CrossEntropyLoss()
 
@@ -476,17 +452,17 @@ def finetune_classifier(model, aug_features, aug_labels, lr=0.0002, epochs=10, d
         lr: Learning rate for fine-tuning.
         epochs: Number of epochs for fine-tuning.
         device: Device to use for computations.
+        
+    Returns:
+        The fine-tuned model.
     """
     # Skip if no features or labels
     if not aug_features or not aug_labels:
         print("No augmented features or labels provided, skipping fine-tuning")
-        return
+        return model
         
-    # Ensure device is set
     if device is None:
         device = next(model.parameters()).device
-    
-    # Ensure model is on the correct device
     model = model.to(device)
     
     # Convert features to tensor
@@ -495,7 +471,7 @@ def finetune_classifier(model, aug_features, aug_labels, lr=0.0002, epochs=10, d
             aug_features = torch.stack([f.to(device) for f in aug_features])
         except Exception as e:
             print(f"Error stacking features: {e}")
-            return
+            return model
             
     # Convert labels to tensor
     if not isinstance(aug_labels, torch.Tensor):
@@ -507,24 +483,30 @@ def finetune_classifier(model, aug_features, aug_labels, lr=0.0002, epochs=10, d
                 aug_labels = torch.tensor(aug_labels, device=device)
         except Exception as e:
             print(f"Error converting labels to tensor: {e}")
-            return
+            return model
     
     # Move tensors to device
     aug_features = aug_features.to(device)
     aug_labels = aug_labels.to(device)
     
-    # Check if classifier needs to be expanded for one-hot labels
-    if aug_labels.ndim == 2 and aug_labels.size(1) > model.classifier.out_features:
-        print(f"Expanding classifier output from {model.classifier.out_features} to {aug_labels.size(1)}")
-        old_classifier = model.classifier
-        new_classifier = nn.Linear(old_classifier.in_features, aug_labels.size(1)).to(device)
+    # Check for dimension mismatch and handle appropriately
+    if aug_labels.ndim == 2:
+        output_size = model.classifier.out_features
+        label_size = aug_labels.size(1)
         
-        # Copy existing weights
-        with torch.no_grad():
-            new_classifier.weight[:old_classifier.out_features] = old_classifier.weight
-            new_classifier.bias[:old_classifier.out_features] = old_classifier.bias
+        if output_size != label_size:
+            #print(f"Dimension mismatch during fine-tuning: model output size {output_size} != label size {label_size}")
             
-        model.classifier = new_classifier
+            # If model has fewer output dimensions than labels in the current dataset, expand the model to accommodate new classes
+            if output_size < label_size:
+                #print(f"Expanding model from {output_size} to {label_size} classes to handle new classes")
+                model.incremental_learning([], label_size)
+            else:
+                # If model has more output dimensions than labels in the current dataset, pad the labels with zeros
+                #print(f"Padding labels from size {label_size} to {output_size} to match model dimensions")
+                new_labels = torch.zeros(aug_labels.shape[0], output_size, device=device)
+                new_labels[:, :label_size] = aug_labels
+                aug_labels = new_labels
     
     # Choose loss function based on label format
     if aug_labels.ndim == 2:
@@ -536,23 +518,19 @@ def finetune_classifier(model, aug_features, aug_labels, lr=0.0002, epochs=10, d
     
     # Only optimize classifier weights
     model.classifier.train()
-    #optimizer = torch.optim.Adam(model.classifier.parameters(), lr=lr)
     optimizer = optim.NAdam(
-    model.classifier.parameters(),
-    lr=lr,
-    betas=(0.9, 0.999),
-    eps=1e-08,
-    weight_decay=0,       
-    momentum_decay=0.004
+        model.classifier.parameters(),
+        lr=lr,
+        betas=(0.9, 0.999),
+        eps=1e-08,
+        weight_decay=0,       
+        momentum_decay=0.004
     )
 
     # Prepare dataloader
-    try:
-        dataset = torch.utils.data.TensorDataset(aug_features, aug_labels)
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=16, shuffle=True)
-    except Exception as e:
-        print(f"Error creating dataloader: {e}")
-        return
+    dataset = torch.utils.data.TensorDataset(aug_features, aug_labels)
+    batch_size = min(16, len(dataset))  # Use smaller batch size for fine-tuning
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # Training loop
     for epoch in range(epochs):
@@ -563,33 +541,30 @@ def finetune_classifier(model, aug_features, aug_labels, lr=0.0002, epochs=10, d
             optimizer.zero_grad()
             outputs = model.classifier(features)
             
-            try:
-                loss = loss_fn(outputs, labels)
-                loss.backward()
-                optimizer.step()
-                epoch_loss += loss.item()
-            except Exception as e:
-                print(f"Error during fine-tuning: {e}")
-                print(f"Features shape: {features.shape}, Labels shape: {labels.shape}")
-                print(f"Outputs shape: {outputs.shape}")
-                print(f"Device check - Features: {features.device}, Labels: {labels.device}, Model: {next(model.parameters()).device}")
-                return
+            loss = loss_fn(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
 
         avg_loss = epoch_loss / len(dataloader)
-        #print(f"Epoch {epoch+1}/{epochs}, Fine-tune Loss: {avg_loss:.4f}")
-        
+        # Print progress every 5 epochs
+        if epoch % 5 == 0:
+            print(f"Epoch {epoch+1}/{epochs}, Fine-tune Loss: {avg_loss:.4f}")
+    
     # Set model back to eval mode
     model.eval()
+    
+    return model
 
 def compute_embeddings(model, dataloader, device=None):
     """Compute the embeddings of the model on the given dataset.
     
     Args:
         model: The model to be computed.
-        dataloader: DataLoader with validation batches.
+        dataloader: Dataset to compute embeddings on.
         
     Returns:
-        Dictionary mapping activity indices to lists of embeddings
+        Dictionary mapping activity indices to lists of embeddings, i.e., class prototypes.
     """
     device = next(model.parameters()).device
     model.to(device)

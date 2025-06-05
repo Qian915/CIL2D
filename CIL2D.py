@@ -13,24 +13,22 @@ from scipy.spatial import distance
 import torch.nn.functional as F
 import json
 
-# Add the project root to the path
-#sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 
 # Import local modules
 from lib.data.IncrementalDataLoader import LogsDataLoader
-from lib.model.incremental_model import (DynamicEmbedding, IncrementalLSTMClassifier, train_model, evaluate_model, predict_model, update_model, compute_embeddings, finetune_classifier)
+from lib.model.incremental_model import (DynamicEmbedding, IncrementalLSTMClassifier, train_model, evaluate_model, model_predict, update_model, compute_embeddings, finetune_classifier)
 
 def parse_arguments():
-    """Parse command line arguments."""
-    parser = argparse.ArgumentParser(description="Prototype-based Continual Learning for Next Activity Prediction")
+    """Parse arguments."""
+    parser = argparse.ArgumentParser(description="Class Incremental Learning with Drift Detection and Data Augmentation for Dynamic Processes")
     # Dataset parameters
-    parser.add_argument("--dataset", type=str, default="BPIC15_1", 
+    parser.add_argument("--dataset", type=str, default="Sepsis", 
                         help="Name of the dataset")
     parser.add_argument("--data_dir", type=str, default="./data",
                         help="Path to the data directory")
     parser.add_argument("--window_type", type=str, default="month", choices=["day", "week", "month", None],
                         help="Type of time window for test batches")
-    parser.add_argument("--train_test_ratio", type=float, default=0.50,
+    parser.add_argument("--train_test_ratio", type=float, default=0.10,
                         help="Ratio for splitting training and test data")
     
     # Model parameters
@@ -64,39 +62,26 @@ def parse_arguments():
     parser.add_argument("--min_samples", type=int, default=3,
                         help="Minimum number of samples required to compute reliable statistics")
     
-    # Augmentation parameters
-    parser.add_argument("--augment", action="store_true",
-                        help="Use feature augmentation")
+    # Data Augmentation parameters
     parser.add_argument("--alpha", type=float, default=20.0,
                         help="Mixing parameter for feature augmentation")
-    
-    # Enhanced augmentation parameters
-    parser.add_argument("--max_samples_per_activity", type=int, default=1000,
+    parser.add_argument("--max_samples_per_activity", type=int, default=500,
                         help="Maximum number of augmented samples per activity")
     parser.add_argument("--num_closest", type=int, default=5,
                         help="Number of closest activities to use for cross-activity augmentation")
-    parser.add_argument("--buffer_size_per_class", type=int, default=10,
+
+    # Replay Buffer parameters
+    parser.add_argument("--buffer_size_per_class", type=int, default=20,
                         help="Number of representative samples to keep per class in the replay buffer")
     
     # Misc parameters
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducibility")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                         help="Device for training/evaluation")
     parser.add_argument("--output_dir", type=str, default="./results",
                         help="Directory to save results")
-    parser.add_argument("--aggregate", action="store_true",
-                        help="Aggregate results from multiple runs")
     
     return parser.parse_args()
 
-def set_seed(seed):
-    """Set random seed for reproducibility."""
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
 
 def create_output_dir(args):
     """Create output directory for results."""
@@ -132,17 +117,6 @@ def save_parameters(args, output_dir):
     
     return params_dict
 
-def format_time(seconds):
-    """Format time in seconds to both seconds with 2 decimals and HH:MM:SS format."""
-    seconds_formatted = f"{seconds:.2f}"
-    
-    # Convert to HH:MM:SS
-    hours, remainder = divmod(int(seconds), 3600)
-    minutes, seconds = divmod(remainder, 60)
-    time_str = f"{hours}:{minutes:02}:{seconds:02}"
-    
-    return f"{seconds_formatted} ({time_str})"
-
 def plot_accuracy_over_time(batch_accuracies, batch_timestamps, output_dir):
     """Plot accuracy over time."""
     plt.figure(figsize=(12, 6))
@@ -154,56 +128,6 @@ def plot_accuracy_over_time(batch_accuracies, batch_timestamps, output_dir):
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'accuracy_over_time.png'))
     plt.close()
-
-def compute_prototypes(embedding_dict):
-    """Compute mean embedding (prototype) for each activity."""
-    # Get the global device if exists
-    if 'device' not in globals():
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = globals()['device']
-        
-    prototypes = {}
-    for act, embeddings in embedding_dict.items():
-        if not embeddings:
-            continue
-            
-        # Ensure all embeddings are on the same device
-        aligned_embeddings = [emb.to(device) for emb in embeddings]
-        
-        # Calculate the mean prototype
-        prototypes[act] = torch.stack(aligned_embeddings).mean(dim=0)
-    return prototypes
-
-def compute_distances(from_prototypes, to_prototypes, use_cosine=True):
-    """Compute distances between current and all past prototypes."""
-    # Get the global device if exists
-    if 'device' not in globals():
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    else:
-        device = globals()['device']
-            
-    # distances: {from_act: {to_act: distance}}
-    distances = {}
-    for from_act in from_prototypes.keys():
-        distances[from_act] = {}
-        for to_act in to_prototypes.keys():
-            # Move tensors to the same device
-            from_proto = from_prototypes[from_act].to(device)
-            to_proto = to_prototypes[to_act].to(device)
-            
-            if use_cosine:
-                # Calculate cosine similarity: 1 - similarity gives distance
-                cosine_sim = torch.nn.functional.cosine_similarity(
-                    from_proto.unsqueeze(0), to_proto.unsqueeze(0)).item()
-                distances[from_act][to_act] = 1.0 - cosine_sim
-            else:
-                # Calculate Euclidean distance
-                distances[from_act][to_act] = torch.norm(from_proto - to_proto).item()
-    return distances
-
-def find_closest_activity(distances, from_act):
-    return min(distances[from_act].keys(), key=lambda x: distances[from_act][x])
 
 def detect_drifts_with_global_prototypes(curr_embeddings, global_prototypes, replay_buffer,
                                default_threshold=0.2, novelty_threshold_factor=2.0, use_cosine=True, min_samples=3):
@@ -221,7 +145,6 @@ def detect_drifts_with_global_prototypes(curr_embeddings, global_prototypes, rep
     Returns:
         Tuple of (unseen_activities, drifting_activities, novel_activities) sets
     """
-    print("Using global prototypes for drift detection")
     
     # Get device
     if 'device' not in globals():
@@ -229,14 +152,9 @@ def detect_drifts_with_global_prototypes(curr_embeddings, global_prototypes, rep
     else:
         device = globals()['device']
     
-    # Validate input parameters
-    if not isinstance(curr_embeddings, dict) or not isinstance(global_prototypes, dict):
-        print("Warning: Invalid input parameters for drift detection")
-        return set(), set(), set()
-    
     # Set default thresholds based on distance metric
     if use_cosine:
-        base_drift_threshold = 0.1  # Cosine distance threshold (0-2 range)
+        base_drift_threshold = 0.1  # Cosine distance threshold
     else:
         base_drift_threshold = default_threshold  # Euclidean distance threshold
     base_novelty_threshold = base_drift_threshold * novelty_threshold_factor
@@ -308,11 +226,11 @@ def detect_drifts_with_global_prototypes(curr_embeddings, global_prototypes, rep
                 
                 # Check against thresholds
                 if mean_distance > novelty_threshold:
-                    # Novelty detected - a new pattern of existing activity
+                    # Novelty detected - a significant new pattern of existing activity
                     novel_activities.add(activity_idx)
                     #print(f"Novel pattern detected for activity {activity_idx}: distance = {mean_distance:.4f}, threshold = {novelty_threshold:.4f}")
                 elif mean_distance > drift_threshold:
-                    # Drift detected - existing activity has changed
+                    # Drift detected - existing activity pattern has changed
                     drifting_activities.add(activity_idx)
                     #print(f"Drift detected for activity {activity_idx}: distance = {mean_distance:.4f}, threshold = {drift_threshold:.4f}")
                 else:
@@ -693,107 +611,6 @@ def aug_across_activity(novel_activities, curr_embeddings, global_prototypes,
     
     return mixed_embeddings_list, mixed_labels_list
 
-def aggregate_results(base_dir, dataset, window_type=None):
-    """Aggregate results from multiple runs of the same dataset.
-    
-    Args:
-        base_dir: Base output directory
-        dataset: Dataset name
-        window_type: Type of time window (day, week, month, etc.)
-    
-    Returns:
-        DataFrame with aggregated results
-    """
-    dataset_dir = os.path.join(base_dir, dataset)
-    
-    if not os.path.exists(dataset_dir):
-        print(f"No results found for {dataset}")
-        return None
-    
-    # If window_type is specified, look in that subdirectory
-    if window_type:
-        window_dir = os.path.join(dataset_dir, window_type)
-        if os.path.exists(window_dir):
-            dataset_dir = window_dir
-        else:
-            print(f"No results found for {dataset} with window_type {window_type}")
-            return None
-    
-    # Find all run directories in the specified path
-    run_dirs = [d for d in os.listdir(dataset_dir) if d.startswith("run_")]
-    if not run_dirs:
-        # If no run directories at this level, try looking in subdirectories (for window types)
-        if not window_type:
-            all_results = []
-            # Process each window type as a separate group
-            for subdir in os.listdir(dataset_dir):
-                subdir_path = os.path.join(dataset_dir, subdir)
-                if os.path.isdir(subdir_path):
-                    # Recursively call aggregate_results for each window type
-                    window_results = aggregate_results(base_dir, dataset, subdir)
-                    if window_results is not None:
-                        all_results.append(window_results)
-            
-            if all_results:
-                # Combine results from different window types
-                combined_results = pd.concat(all_results, ignore_index=True)
-                agg_file = os.path.join(dataset_dir, "aggregated_results_all_windows.csv")
-                combined_results.to_csv(agg_file, index=False)
-                print(f"Aggregated results for all window types saved to {agg_file}")
-                return combined_results
-        
-        print(f"No run directories found for {dataset}{' with window_type ' + window_type if window_type else ''}")
-        return None
-    
-    # Collect results from each run
-    all_results = []
-    for run_dir in run_dirs:
-        results_file = os.path.join(dataset_dir, run_dir, "results.csv")
-        if os.path.exists(results_file):
-            run_results = pd.read_csv(results_file)
-            run_results['run_id'] = run_dir
-            all_results.append(run_results)
-    
-    if not all_results:
-        print(f"No results found in any run directory for {dataset}")
-        return None
-    
-    # Combine all results
-    combined_results = pd.concat(all_results, ignore_index=True)
-    
-    # Calculate aggregate statistics - only for specified metrics
-    metrics_to_aggregate = ['accuracy', 'num_updates', 'num_model_updates', 'total_update_time', 'avg_update_time']
-    
-    aggregated = {}
-    for metric in metrics_to_aggregate:
-        if metric in combined_results.columns:
-            try:
-                # Convert values to float if needed
-                #values = pd.to_numeric(combined_results[metric], errors='coerce').dropna().values
-                values = combined_results[metric].values
-                # Calculate mean and format to 2 decimal places
-                if len(values) > 0:
-                    if metric == 'accuracy':
-                        aggregated[f'{metric}'] = round(float(np.mean(values)) * 100, 2)
-                    else:
-                        aggregated[f'{metric}'] = round(float(np.mean(values)), 2)
-                else:
-                    aggregated[f'{metric}'] = "N/A"
-            except Exception as e:
-                print(f"Warning: Could not aggregate metric '{metric}': {e}")
-                aggregated[f'{metric}'] = f"Error: {str(e)[:30]}..."
-    
-    # Add number of runs
-    #aggregated['num_runs'] = len(all_results)
-    
-    # Save aggregated results
-    agg_df = pd.DataFrame([aggregated])
-    agg_file = os.path.join(dataset_dir, "aggregated_results.csv")
-    agg_df.to_csv(agg_file, index=False)
-    print(f"Aggregated results saved to {agg_file}")
-    
-    return agg_df
-
 def compute_embeddings_with_raw(model, dataloader, device=None):
     """
     Compute embeddings and keep raw inputs + labels.
@@ -1165,118 +982,15 @@ def combine_dataloaders(current_loader, replay_loader, batch_size=32, shuffle=Tr
     
     return combined_loader
 
-def finetune_classifier(model, features, labels, lr=0.0002, epochs=10, device=None):
-    """Fine-tune the classifier head of the model with new features and labels.
-    
-    Args:
-        model: IncrementalLSTMClassifier model
-        features: List or tensor of feature vectors
-        labels: List or tensor of one-hot encoded labels
-        lr: Learning rate
-        epochs: Number of training epochs
-        device: Device to use for computation
-        
-    Returns:
-        Fine-tuned model
-    """
-    if device is None:
-        device = next(model.parameters()).device
-    
-    # Convert lists to tensors if needed
-    if isinstance(features, list):
-        features = torch.stack(features)
-    if isinstance(labels, list):
-        labels = torch.stack(labels)
-    
-    # Move to device
-    features = features.to(device)
-    labels = labels.to(device)
-    
-    # Ensure dimensions match - add handling for dimension mismatch
-    output_size = model.classifier.out_features
-    label_size = labels.shape[1]
-    
-    # Print shapes for debugging
-    #print(f"Features shape: {features.shape}, Labels shape: {labels.shape}")
-    #print(f"Outputs shape: {torch.Size([features.shape[0], output_size])}")
-    #print(f"Device check - Features: {features.device}, Labels: {labels.device}, Model: {next(model.parameters()).device}")
-    
-    # Handle dimension mismatch
-    if output_size != label_size:
-        print(f"Dimension mismatch during fine-tuning: model output size {output_size} != label size {label_size}")
-        
-        # Adapt labels if the model has more output classes than current labels
-        if output_size > label_size:
-            # Pad labels with zeros to match the model output size
-            new_labels = torch.zeros(labels.shape[0], output_size, device=device)
-            new_labels[:, :label_size] = labels
-            labels = new_labels
-            print(f"Adapted labels to size {labels.shape}")
-        else:
-            # If model has fewer outputs than labels, we need to expand the model
-            print(f"Expanding model from {output_size} to {label_size} classes")
-            model.incremental_learning([], label_size)
-    
-    try:
-        # Create dataset and data loader
-        dataset = torch.utils.data.TensorDataset(features, labels)
-        batch_size = min(16, len(dataset))  # Use smaller batch size for fine-tuning
-        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-        
-        # Set up optimizer for classifier only
-        optimizer = torch.optim.Adam(model.classifier.parameters(), lr=lr)
-        
-        # Set model to training mode
-        model.train()
-        
-        # Fine-tune for a few epochs
-        for epoch in range(epochs):
-            total_loss = 0
-            for batch_features, batch_labels in dataloader:
-                # Forward pass
-                logits = model.classifier(batch_features)
-                
-                # Compute loss
-                loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, batch_labels)
-                
-                # Backward pass
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                
-                total_loss += loss.item()
-            
-            # Print progress
-            if epoch % 5 == 0:
-                print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(dataloader):.4f}")
-        
-        return model
-        
-    except Exception as e:
-        print(f"Error during fine-tuning: {e}")
-        # Return the model unchanged
-        return model
-
 def main(args=None):
-    """Main function for the CILDA pipeline."""
-    # Parse arguments if not provided
-    if args is None:
-        args = parse_arguments()
-    
-    # Set random seed
-    #set_seed(args.seed)
-    
     # Create output directory
     output_dir = create_output_dir(args)
     
     # Save all parameter settings
     save_parameters(args, output_dir)
     
-    # Report drift detection method
-    print("Using GLOBAL PROTOTYPES for drift detection")
-    
-    print(f"=== CILDA for {args.dataset} ===")
-    print(f"Results will be saved to: {output_dir}")
+    print(f"=== CIL2D for {args.dataset} ===")
+    #print(f"Results will be saved to: {output_dir}")
     
     # === LOAD DATA ===
     print("\n=== Loading Data ===")
@@ -1298,14 +1012,8 @@ def main(args=None):
     vocab_size = len(loader.vocab_mapper.token_vocab)
     num_classes = len(loader.vocab_mapper.label_vocab)
     
-    #print(f"Number of (training) input classes: {vocab_size}")
-    #print(f"Number of (training) output classes: {num_classes}")
-    #print(f"Max case length: {loader.max_case_length}")
-    
-    # Determine device to use and make it global
     global device
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    #print(f"Using device: {device}")
 
     # Initialize and train the model
     train_start_time = time.time()
@@ -1315,11 +1023,10 @@ def main(args=None):
         hidden_dim=args.hidden_dim,
         num_classes=num_classes,
         padding_idx=loader.vocab_mapper.pad_idx
-    ).to(device)  # Move model to device
+    ).to(device)  
     # Set the global one_hot_size after initializing model
     global one_hot_size
-    one_hot_size = max(vocab_size, num_classes) # +1 for pad
-    #print(f"Setting one_hot_size={one_hot_size} based on model vocabulary")
+    one_hot_size = max(vocab_size, num_classes)
     
     model, training_stats = train_model(
         model=model,
@@ -1327,11 +1034,11 @@ def main(args=None):
         epochs=args.epochs,
         patience=args.patience,
         lr=args.learning_rate,
-        device=device  # Pass device to training function
+        device=device
     )
     train_end_time = time.time()
 
-    # Extract features and raw inputs for training data
+    # Extract features and raw inputs from training data
     train_data_by_label = compute_embeddings_with_raw(model, train_dataloader, device=device)
     
     # Update prototypes
@@ -1342,7 +1049,6 @@ def main(args=None):
     
     # Initialize replay buffer with representative samples from training data
     replay_buffer = {'X': [], 'y': [], 'samples_by_label': {}}
-    # Use the buffer size from the command line arguments
     buffer_size_per_class = args.buffer_size_per_class
     #print(f"Using replay buffer size of {buffer_size_per_class} samples per class")
     replay_buffer, global_prototypes = update_replay_buffer_with_blending(
@@ -1378,15 +1084,14 @@ def main(args=None):
     
     # Process each batch
     for i, (batch_time, batch_df) in enumerate(test_batches.items()):
-        print(f"\n=== Predicting batch {i+1}/{len(test_batches)} based on global prototypes - {batch_time} ===")
+        print(f"\n=== Predicting batch {i+1}/{len(test_batches)} - {batch_time} ===")
         
-        # Ensure model is on the specified device before each batch
         model = model.to(device)
         
         # Encode test data
         test_dataloader = loader.encode_and_prepare(batch_df, args.batch_size, shuffle=False)
         
-        # Check for vocabulary expansion and update model if needed
+        # Check for vocabulary and expand model architecture if needed
         try:
             if len(loader.vocab_mapper.token_vocab) > len(model.embed.vocab):
                 # Get only new tokens that are not in the current vocabulary
@@ -1399,8 +1104,7 @@ def main(args=None):
                 model.incremental_learning([], len(loader.vocab_mapper.label_vocab))
                 
             # Update one_hot_size whenever the vocabulary expands
-            one_hot_size = max(len(model.embed.vocab), len(loader.vocab_mapper.label_vocab))  # +1 for pad
-            #print(f"Updating one_hot_size={one_hot_size} based on expanded vocabulary")
+            one_hot_size = max(len(model.embed.vocab), len(loader.vocab_mapper.label_vocab))
             
         except Exception as e:
             print(f"Error during vocabulary expansion: {e}")
@@ -1411,11 +1115,11 @@ def main(args=None):
             raise
             
         # Make predictions
-        accuracy, predictions, ground_truth = predict_model(model, test_dataloader, device=device)
+        accuracy, predictions, ground_truth = model_predict(model, test_dataloader, device=device)
         # Extract features and raw inputs for test data
         curr_data_by_label = compute_embeddings_with_raw(model, test_dataloader, device=device)
         
-        # For backward compatibility with existing code, extract just the embeddings
+        # Get current embeddings
         curr_embeddings = {k: [e for e, _, _ in v] for k, v in curr_data_by_label.items()}
         
         # Store and calculate batch accuracy
@@ -1440,8 +1144,10 @@ def main(args=None):
             min_samples=args.min_samples
         )
         
+        # === DATA AUGMENTATION ===
         need_update = bool(unseen_activities or drifting_activities or novel_activities)
         if need_update:
+            print("-> Data Augmentation <-")
             ### feature augmentation
             aug_features = []
             aug_labels = []     # one-hot encoded labels!
@@ -1472,30 +1178,19 @@ def main(args=None):
                 aug_features.extend(aug_emb_list)
                 aug_labels.extend(aug_lab_list)
                 
-            print(f"Number of augmented samples: {len(aug_features)}")
+            #print(f"Number of augmented samples: {len(aug_features)}")
                 
-            ### update model
-            # Ensure model is on the device before fine-tuning
+            # === UPDATE MODEL ===
             model = model.to(device)
-            # fine-tune classifier first with explicit device
+            # fine-tune classifier first on augmented samples
             if len(aug_features) > 10:
-                '''
-                # Ensure model is expanded to handle new classes if necessary
-                current_num_classes = model.classifier.out_features
-                max_label_idx = max([label.argmax().item() for label in aug_labels]) if aug_labels else 0
-                needed_classes = max_label_idx + 1
-                
-                if needed_classes > current_num_classes:
-                    print(f"Expanding model from {current_num_classes} to {needed_classes} classes before fine-tuning")
-                    model.incremental_learning([], needed_classes)
-                '''
-                # Now fine-tune
-                finetune_classifier(model, aug_features, aug_labels, 
+                print("-> Finetuning Classifier <-")
+                model = finetune_classifier(model, aug_features, aug_labels, 
                                 lr=args.lr_finetune, 
                                 epochs=args.epochs_finetune, 
                                 device=device)
                 
-            # incremental learning if unseen or novel activities: update on test set and a buffer of past data!
+            # incremental learning if unseen or novel activities: update on current data and a buffer of past samples!
             if (unseen_activities or novel_activities) and len(test_dataloader.dataset) > 10:
                 model = model.to(device)
                 
@@ -1509,9 +1204,8 @@ def main(args=None):
                 
                 # Use combined data (current + replay) for model update
                 if replay_loader:
-                    #print(f"Combining current batch ({len(test_dataloader.dataset)} samples) with replay buffer ({len(replay_loader.dataset)} samples)")
                     combined_loader = combine_dataloaders(test_dataloader, replay_loader, batch_size=args.batch_size)
-                    
+                    print("-> Updating Full Model <-")
                     model = update_model(
                         model, 
                         dataloader=combined_loader,
@@ -1535,18 +1229,14 @@ def main(args=None):
         # update model prototypes after drift detection
         model.update_prototypes(curr_embeddings)
         
-        # Update the replay buffer with the current batch data
-        # using the blended prototype approach for memory efficiency
-        if 'buffer_size_per_class' in vars(args):
-            buffer_size = args.buffer_size_per_class
-        else:
-            buffer_size = 10  # Default fallback
-            
+        # === Post-prediction Update ===
+        print("-> Updating Replay Buffer and Global Prototypes <-")
+        # Update the replay buffer and global prototypes            
         replay_buffer, global_prototypes = update_replay_buffer_with_blending(
             replay_buffer,
             curr_data_by_label,
             global_prototypes,
-            buffer_size_per_class=buffer_size,
+            buffer_size_per_class=args.buffer_size_per_class,
             alpha=0.7,  # Balance between stability and adaptivity
             beta=0.9,   # Momentum for global prototype update
             device=device
@@ -1564,7 +1254,6 @@ def main(args=None):
     all_predictions = torch.cat([pred.cpu() for pred in batch_predictions])
     all_ground_truth = torch.cat([gt.cpu() for gt in batch_ground_truth])
     
-    # Move tensors to CPU before converting to numpy
     all_predictions = all_predictions.cpu().numpy()
     all_ground_truth = all_ground_truth.cpu().numpy()
     
@@ -1574,26 +1263,13 @@ def main(args=None):
         "f1_weighted": f1_score(all_ground_truth, all_predictions, average="weighted"),
         "precision_weighted": precision_score(all_ground_truth, all_predictions, average="weighted"),
         "recall_weighted": recall_score(all_ground_truth, all_predictions, average="weighted"),
-        "total_samples": len(all_ground_truth),
         "training_time": train_end_time - train_start_time,
         "num_updates": num_updates,
         "num_model_updates": num_model_updates,
         "total_update_time": total_update_time,
         "avg_update_time": total_update_time / max(1, num_updates)
     }
-    '''
-    # Save all formatted metrics with parameter settings
-    formatted_metrics = {}
-    for key, value in metrics.items():
-        if key in ["accuracy", "f1_weighted", "precision_weighted", "recall_weighted"]:
-            formatted_value = f"{value:.2f}"
-            formatted_metrics[key] = formatted_value
-        elif "time" in key:
-            #formatted_value = format_time(value)
-            formatted_metrics[key] = value
-        else:
-            formatted_metrics[key] = value
-    '''
+    
     # Print summary of key metrics
     print("\nPerformance Summary:")
     print(f"Accuracy: {metrics['accuracy']}")
@@ -1608,31 +1284,18 @@ def main(args=None):
     batch_results = pd.DataFrame({
         "batch_time": batch_timestamps,
         "batch_accuracy": [f"{acc*100:.2f}" for acc in batch_accuracies],
-        "batch_update_time": [format_time(t) for t in batch_update_times] if batch_update_times else ["0.00 (0:00:00)"] * len(batch_timestamps)
+        "batch_update_time": [t for t in batch_update_times]
     })
     batch_results.to_csv(os.path.join(output_dir, "batch_results.csv"), index=False)
     
-    # Plot accuracy over time - using raw accuracy values
+    # Plot accuracy over time
     plot_accuracy_over_time(batch_accuracies, batch_timestamps, output_dir)
     
     print(f"\nResults saved to {output_dir}")
-    print("\nDone!")
     
     # Return metrics for potential aggregation
     return output_dir, metrics
 
 if __name__ == "__main__":
     args = parse_arguments()
-    
-    # Check if we should just run aggregation
-    if args.aggregate:
-        # Determine paths based on dataset and window_type
-        base_dir = args.output_dir
-        dataset = args.dataset
-        window_type = args.window_type
-        
-        print(f"\n=== Aggregating results for {dataset}{' with window_type ' + window_type if window_type else ''} ===")
-        aggregate_results(base_dir, dataset, window_type)
-    else:
-        # Run the normal experimental pipeline
-        output_dir, _ = main(args) 
+    output_dir, _ = main(args) 

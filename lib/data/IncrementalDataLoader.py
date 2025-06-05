@@ -115,7 +115,7 @@ class LogsDataLoader:
         self.traces = self.traces.sort_values('last_event_time').reset_index(drop=True)
         raw_max = max(self.traces['prefix'].apply(lambda x: len(x.split())))
         self.max_case_length = min(raw_max, 40)
-        print(f"Loaded {len(self.traces)} traces; max_case_length={self.max_case_length}")
+        #print(f"Loaded {len(self.traces)} traces; max_case_length={self.max_case_length}")
         return self.traces
 
     def split_train_test(self, train_test_ratio):
@@ -125,7 +125,7 @@ class LogsDataLoader:
         split_idx = int(len(sorted_traces) * train_test_ratio)
         self.train_df = sorted_traces.iloc[:split_idx].copy()
         self.test_df = sorted_traces.iloc[split_idx:].copy()
-        print(f"Split at {self.train_df['last_event_time'].max()} | train={len(self.train_df)} | test={len(self.test_df)}")
+        #print(f"Split at {self.train_df['last_event_time'].max()} | train={len(self.train_df)} | test={len(self.test_df)}")
         return self.train_df, self.test_df
 
     def create_batches(self, df):
@@ -141,11 +141,11 @@ class LogsDataLoader:
         else:
             raise ValueError(f"Invalid window_type: {self.window_type}")
         batches = {grp: grp_df.drop(col, axis=1) for grp, grp_df in df.groupby(col)}
-        print(f"Created {len(batches)} batches by {self.window_type}")
+        #print(f"Created {len(batches)} batches by {self.window_type}")
         return batches
 
     def encode_and_prepare(self, df, batch_size=32, shuffle=True):
-        # Split prefixes and next_act
+        # Get prefixes and next_act
         token_seqs = [row.split() for row in df['prefix'].values]
         labels = df['next_act'].tolist()
         # Encode inputs / labels and expand vocab if unseen

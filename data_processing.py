@@ -6,12 +6,12 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '.')))
 from lib.data.processor import LogsDataProcessor
 
-# Parse command line arguments
-parser = argparse.ArgumentParser(description="Process logs for SDL Prototype Learning.")
+# Parse arguments
+parser = argparse.ArgumentParser(description="Process raw event logs for CIL2D.")
 
 parser.add_argument("--dataset", 
     type=str, 
-    default="BPIC15_1", 
+    default="Sepsis", 
     help="dataset name")
 
 parser.add_argument("--dir_path", 
@@ -21,7 +21,7 @@ parser.add_argument("--dir_path",
 
 parser.add_argument("--raw_log_file", 
     type=str, 
-    default="./data/BPIC15_1/BPIC15_1.csv", 
+    default="./data/Sepsis/Sepsis.csv", 
     help="path to raw csv log file")
 
 parser.add_argument("--sort_temporally", 
@@ -32,7 +32,7 @@ parser.add_argument("--sort_temporally",
 parser.add_argument("--add_eoc", 
     type=bool, 
     default=False, 
-    help="add [EOC] markers to each case")
+    help="add [EOC] to each case")
 
 args = parser.parse_args()
 
@@ -51,14 +51,13 @@ if __name__ == "__main__":
         add_eoc=args.add_eoc
     )
     
-    # Generate prefixes
+    # Create prefixes
     prefixes_df = data_processor.create_prefixes(event_log)
     
-    # Print summary
-    print(f"Generated {len(prefixes_df)} prefixes for {args.dataset}")
+    #print(f"Created {len(prefixes_df)} prefixes for {args.dataset}")
     
     # Save the preprocessed data to a file for later use
     output_dir = f"{args.dir_path}/{args.dataset}/processed"
     os.makedirs(output_dir, exist_ok=True)
     prefixes_df.to_csv(f"{output_dir}/prefixes.csv", index=False)
-    print(f"Prefixes saved to {output_dir}/prefixes.csv") 
+    #print(f"Prefixes saved to {output_dir}/prefixes.csv") 
