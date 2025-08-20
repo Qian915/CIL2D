@@ -442,118 +442,131 @@ def update_model(model, dataloader, lr=0.001, epochs=100, patience=10, device=No
 
     return model
 
-def finetune_classifier(model, aug_features, aug_labels, lr=0.0002, epochs=10, device=None):
-    """Finetune the classifier of the model on the augmented features.
+def finetune_classifier(model, real_features, real_labels, aug_features, aug_labels, lr=0.0002, epochs=100, patience=10, device=None):
+    """Finetune the classifier with train/val split and early stopping.
     
     Args:
-        model: The model to be finetuned.
-        aug_features: Features from the last hidden state.
-        aug_labels: Labels for the features.
-        lr: Learning rate for fine-tuning.
-        epochs: Number of epochs for fine-tuning.
-        device: Device to use for computations.
-        
-    Returns:
-        The fine-tuned model.
+        model: The model to finetune
+        real_features: Real feature tensors [N, hidden_dim]
+        real_labels: Real labels [N]
+        aug_features: Augmented feature tensors [M, hidden_dim]
+        aug_labels: Augmented labels [M]
+        lr: Learning rate
+        epochs: Maximum number of epochs
+        patience: Early stopping patience
+        device: Device to use
     """
-    # Skip if no features or labels
-    if not aug_features or not aug_labels:
-        print("No augmented features or labels provided, skipping fine-tuning")
-        return model
-        
     if device is None:
-        device = next(model.parameters()).device
-    model = model.to(device)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Convert features to tensor
-    if not isinstance(aug_features, torch.Tensor):
-        try:
-            aug_features = torch.stack([f.to(device) for f in aug_features])
-        except Exception as e:
-            print(f"Error stacking features: {e}")
-            return model
-            
-    # Convert labels to tensor
-    if not isinstance(aug_labels, torch.Tensor):
-        try:
-            # Check if labels are tensors (one-hot)
-            if len(aug_labels) > 0 and isinstance(aug_labels[0], torch.Tensor):
-                aug_labels = torch.stack([label.to(device) for label in aug_labels])
-            else:
-                aug_labels = torch.tensor(aug_labels, device=device)
-        except Exception as e:
-            print(f"Error converting labels to tensor: {e}")
-            return model
-    
-    # Move tensors to device
+    # Check inputs
+    if aug_features.numel() == 0 or aug_labels.numel() == 0:
+        print("No augmented samples provided for fine-tuning")
+        return
+        
+    # Ensure all tensors are on the correct device
+    real_features = real_features.to(device)
+    real_labels = real_labels.to(device)
     aug_features = aug_features.to(device)
     aug_labels = aug_labels.to(device)
     
-    # Check for dimension mismatch and handle appropriately
-    if aug_labels.ndim == 2:
-        output_size = model.classifier.out_features
-        label_size = aug_labels.size(1)
-        
-        if output_size != label_size:
-            #print(f"Dimension mismatch during fine-tuning: model output size {output_size} != label size {label_size}")
-            
-            # If model has fewer output dimensions than labels in the current dataset, expand the model to accommodate new classes
-            if output_size < label_size:
-                #print(f"Expanding model from {output_size} to {label_size} classes to handle new classes")
-                model.incremental_learning([], label_size)
-            else:
-                # If model has more output dimensions than labels in the current dataset, pad the labels with zeros
-                #print(f"Padding labels from size {label_size} to {output_size} to match model dimensions")
-                new_labels = torch.zeros(aug_labels.shape[0], output_size, device=device)
-                new_labels[:, :label_size] = aug_labels
-                aug_labels = new_labels
+    # Combine real and augmented samples
+    all_features = torch.cat([real_features, aug_features])
+    all_labels = torch.cat([real_labels, aug_labels])
+    
+    # Create dataset and split into train/val
+    combined_features = torch.cat([aug_features, real_features], dim=0)
+    combined_labels = torch.cat([aug_labels, real_labels], dim=0)
+    dataset = torch.utils.data.TensorDataset(combined_features, combined_labels)
+    dataset_size = len(dataset)
+    val_size = int(dataset_size * 0.2)
+    train_size = dataset_size - val_size
+    
+    # Adjust batch size based on dataset size
+    batch_size = 16  # Fixed batch size
+    
+    if val_size > 0:
+        train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    else:
+        train_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        val_loader = None
     
     # Choose loss function based on label format
-    if aug_labels.ndim == 2:
-        # Use soft cross entropy for one-hot or soft labels
+    if combined_labels.ndim == 2:  # One-hot encoded soft labels
         loss_fn = soft_cross_entropy
-    else:
-        # Standard cross entropy for class indices
+    else:  # Standard cross entropy for class indices
         loss_fn = nn.CrossEntropyLoss()
     
     # Only optimize classifier weights
     model.classifier.train()
-    optimizer = optim.NAdam(
-        model.classifier.parameters(),
-        lr=lr,
-        betas=(0.9, 0.999),
-        eps=1e-08,
-        weight_decay=0,       
-        momentum_decay=0.004
-    )
+    optimizer = torch.optim.Adam(model.classifier.parameters(), lr=lr, weight_decay=0.0001)
 
-    # Prepare dataloader
-    dataset = torch.utils.data.TensorDataset(aug_features, aug_labels)
-    batch_size = min(16, len(dataset))  # Use smaller batch size for fine-tuning
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    # Training loop
+    # Training loop with early stopping
+    best_val_loss = float('inf')
+    patience_counter = 0
+    early_stopped = False
+    
     for epoch in range(epochs):
-        epoch_loss = 0
-        for features, labels in dataloader:
+        # Training phase
+        model.classifier.train()
+        train_loss = 0
+        for features, labels in train_loader:
             features, labels = features.to(device), labels.to(device)
-
+            
             optimizer.zero_grad()
             outputs = model.classifier(features)
             
-            loss = loss_fn(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-
-        avg_loss = epoch_loss / len(dataloader)
-        # Print progress every 5 epochs
-        if epoch % 5 == 0:
-            print(f"Epoch {epoch+1}/{epochs}, Fine-tune Loss: {avg_loss:.4f}")
+            try:
+                loss = loss_fn(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item()
+            except Exception as e:
+                print(f"Error during fine-tuning: {e}")
+                print(f"Features shape: {features.shape}, Labels shape: {labels.shape}")
+                print(f"Outputs shape: {outputs.shape}")
+                print(f"Device check - Features: {features.device}, Labels: {labels.device}")
+                return
+        
+        avg_train_loss = train_loss / len(train_loader)
+        
+        # Validation phase
+        if val_loader is not None:
+            model.classifier.eval()
+            val_loss = 0
+            with torch.no_grad():
+                for features, labels in val_loader:
+                    features, labels = features.to(device), labels.to(device)
+                    outputs = model.classifier(features)
+                    loss = loss_fn(outputs, labels)
+                    val_loss += loss.item()
+            
+            avg_val_loss = val_loss / len(val_loader)
+            
+            # Early stopping check
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                
+            if patience_counter >= patience:
+                print(f"Fine-tuning stopped at epoch {epoch+1}")
+                early_stopped = True
+                break
+        else:
+            print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}")
     
-    # Set model back to eval mode
+    # Print completion message if we didn't early stop
+    if not early_stopped:
+        if val_loader is not None:
+            print(f"Fine-tuning completed all {epochs} epochs (no early stopping)")
+        else:
+            print(f"Fine-tuning completed all {epochs} epochs (no validation)")
+    
     model.eval()
-    
     return model
 
 def compute_embeddings(model, dataloader, device=None):
@@ -561,10 +574,10 @@ def compute_embeddings(model, dataloader, device=None):
     
     Args:
         model: The model to be computed.
-        dataloader: Dataset to compute embeddings on.
+        dataloader: DataLoader with validation batches.
         
     Returns:
-        Dictionary mapping activity indices to lists of embeddings, i.e., class prototypes.
+        Dictionary mapping activity indices to lists of embeddings
     """
     device = next(model.parameters()).device
     model.to(device)

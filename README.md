@@ -61,7 +61,7 @@ You can specify a different dataset using the `--dataset` parameter. The script 
 After processing the data, run the CIL2D algorithm for incremental learning and prediction:
 
 ```bash
-python CIL2D.py --dataset Sepsis
+python CIL2D.py --dataset Sepsis  --use_cosine
 ```
 
 This will:
@@ -83,8 +83,13 @@ For advanced usage, see the full parameter list in `CIL2D.py`.
 │   ├── data/
 │   │   ├── IncrementalDataLoader.py  # Data loading utilities
 │   │   └── processor.py     # Log processing utilities
-│   └── model/
-│       └── incremental_model.py  # Model architecture and training functions
+│   ├── model/
+│   │   └── incremental_model.py  # Model architecture and training functions
+│   └── utils/
+│       ├── augmentation.py  # Data augmentation functions
+│       ├── drift_detection.py  # Drift detection functions
+│       ├── helper.py  # General utility functions
+│       └── replay_buffer.py  # Replay buffer functions
 ├── data/                     # Data directory
 └── results/                  # Results directory
 ```
